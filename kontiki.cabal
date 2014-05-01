@@ -63,6 +63,7 @@ Executable kontiki-udp
                      , network
                      , binary
                      , conduit
+                     , conduit-extra
                      , network-conduit
                      , rolling-queue
                      , lens

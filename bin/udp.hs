@@ -15,7 +15,7 @@ import qualified Data.Set as Set
 
 import Control.Concurrent (forkIO)
 import Control.Concurrent.STM
-
+import qualified Control.Exception as E
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as LBS
 import qualified Data.ByteString.Lazy.Char8 as LBS8
@@ -24,7 +24,7 @@ import qualified Data.ByteString.Lazy.Builder as Builder
 import System.Environment (getArgs)
 import System.Random (randomRIO)
 
-import Network.Socket (SockAddr(SockAddrInet), inet_addr)
+import Network.Socket
 
 import Control.Lens hiding (Index)
 
@@ -179,9 +179,68 @@ run config' s ps = do
 
     run config' s' ps''
 
+{- From network-conduit -}
+
+-- | Attempt to connect to the given host/port using given @SocketType@.
+getSocket :: String -> Int -> SocketType -> IO (Socket, AddrInfo)
+getSocket host' port' sockettype = do
+    let hints = defaultHints {
+                          addrFlags = [AI_ADDRCONFIG]
+                        , addrSocketType = sockettype
+                        }
+    (addr:_) <- getAddrInfo (Just hints) (Just host') (Just $ show port')
+    sock <- socket (addrFamily addr) (addrSocketType addr) (addrProtocol addr)
+    return (sock, addr)
+
+bindPort :: Int -> String -> CNU.HostPreference -> IO Socket
+bindPort p host s = do
+    sock <- bindPort' p host s Stream
+    listen sock (max 2048 maxListenQueue)
+    return sock
+
+-- | Attempt to bind a listening @Socket@ on the given host/port using given
+-- @SocketType@. If no host is given, will use the first address available.
+bindPort' :: Int -> String -> CNU.HostPreference -> SocketType -> IO Socket
+bindPort' p host s sockettype = do
+    let hints = defaultHints
+            { addrFlags = [ AI_PASSIVE
+                             , AI_NUMERICSERV
+                             , AI_NUMERICHOST
+                             ]
+            , addrSocketType = sockettype
+            }
+        port = Just . show $ p
+    addrs <- getAddrInfo (Just hints) (Just host) port
+    -- Choose an IPv6 socket if exists.  This ensures the socket can
+    -- handle both IPv4 and IPv6 if v6only is false.
+    let addrs4 = filter (\x -> addrFamily x /= AF_INET6) addrs
+        addrs6 = filter (\x -> addrFamily x == AF_INET6) addrs
+        addrs' =
+            case s of
+                "*4" -> addrs4 ++ addrs6
+                "*6" -> addrs6 ++ addrs4
+                _ -> addrs
+
+        tryAddrs (addr1:rest@(_:_)) =
+                                      E.catch
+                                      (theBody addr1)
+                                      (\(_ :: E.IOException) -> tryAddrs rest)
+        tryAddrs (addr1:[])         = theBody addr1
+        tryAddrs _                  = error "bindPort: addrs is empty"
+        theBody addr =
+          E.bracketOnError
+          (socket (addrFamily addr) (addrSocketType addr) (addrProtocol addr))
+          sClose
+          (\sock -> do
+              setSocketOption sock ReuseAddr 1
+              bindSocket sock (addrAddress addr)
+              return sock
+          )
+    tryAddrs addrs'
+
 makeChannel :: NodeId -> String -> Int -> IO (RollingQueue (Message Value))
 makeChannel nn h p = do
-    (sock, _) <- CNU.getSocket h p
+    (sock, _) <- getSocket h p Stream
     q <- RollingQueue.newIO queueSize
     addr <- inet_addr h
     let r = SockAddrInet (toEnum p) addr
@@ -212,7 +271,7 @@ main = do
     ps <- newPlumbingState (Map.fromList chans)
 
     let (_, p) = (Map.!) nodes self
-    sock <- CNU.bindPort (toEnum p) CNU.HostIPv4
+    sock <- bindPort (toEnum p) "" "*4"
     void $ forkIO $ do
         CNU.sourceSocket sock 4096 $=  CL.map (B.decode . LBS.fromStrict . CNU.msgData)
                                    =$= CL.map (uncurry EMessage)
