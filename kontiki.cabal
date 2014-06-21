@@ -55,7 +55,7 @@ Executable kontiki-udp
   Main-Is:             udp.hs
   Build-Depends:       base >= 4 && < 5
                      , mtl
-                     , transformers
+                     , transformers < 0.4
                      , bytestring
                      , stm
                      , containers
